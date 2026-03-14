@@ -1,93 +1,163 @@
-import cv2
-import time
-from modules.hand_tracker import HandTracker
-from modules.menu import Menu
-from modules.sound_player import play_sound
+# main.py
+import sys, os, pygame, cv2, random, math, time
+sys.path.insert(0, os.path.dirname(__file__))
 
-# 🎓 Lesson Modules
-from modules.shapes_colors import run_shapes_colors
-from modules.numbers.numbers import run_numbers      # ✅ Submenu for Numbers
-from modules.numbers.counting import run_counting    # ✅ Renamed from run_counting_game
-from modules.spellings import run_spellings
-from modules.drawing import run_drawing
+from modules.ui.layout import L
+from modules.gesture_engine import GestureEngine, HoldDetector
+from main_menu import run_main_menu
+from lessons.numbers.addition import run_addition
 
-# 🟨 Setup Camera & Hand Tracker
-cap = cv2.VideoCapture(0)
-success, frame = cap.read()
-if not success:
-    print("❌ Failed to grab frame on startup.")
-    exit()
+TITLE = "Touchless Tutor"
+FPS   = 60
 
-h, w = frame.shape[:2]
-tracker = HandTracker()
 
-# 🧡 Main Menu Items
-menu_labels = [
-    "Shapes & Colors",
-    "Numbers",
-    "Counting",
-    "Spellings",
-    "Drawing",
-    "Quit"
-]
-menu = Menu(menu_labels, w, h)
+def _loading_screen(screen, message):
+    screen.fill((15, 12, 30))
+    try:
+        from modules.ui.renderer import Fonts, Colors, draw_text_centered
+        draw_text_centered(screen, message,
+                           Fonts.body(L.font_size(36)), Colors.TEXT_MUTED,
+                           (L.cx, L.cy))
+    except Exception:
+        f = pygame.font.Font(None, 40)
+        s = f.render(message, True, (180, 175, 210))
+        screen.blit(s, s.get_rect(center=(L.cx, L.cy)))
+    pygame.display.flip()
 
-# 🟧 Main Loop
-while True:
-    success, frame = cap.read()
-    if not success:
-        print("❌ Failed to grab frame")
-        break
 
-    frame = cv2.flip(frame, 1)
-    landmarks = tracker.get_landmarks(frame)
+def _show_coming_soon(screen, ge, name):
+    from modules.ui.renderer import (Colors, Fonts, draw_text_centered,
+                                     draw_stars_bg, hold_ring, rounded_rect,
+                                     glow_circle, draw_hand_skeleton)
+    stars = [(random.randint(0, L.sw), random.randint(0, L.sh),
+              random.randint(1, 2), random.uniform(0, 6.28))
+             for _ in range(80)]
+    hold  = HoldDetector(hold_seconds=1.5)
+    clock = pygame.time.Clock()
+    t     = 0.0
 
-    # 🎨 Draw Menu
-    menu.draw(frame)
+    # Back button centred horizontally, near bottom of UI zone
+    btn_w, btn_h = L.s(200), L.s(60)
+    back_rect = pygame.Rect(L.cx - btn_w // 2,
+                            L.ui_bottom - btn_h - L.s(10),
+                            btn_w, btn_h)
 
-    # ✋ Check Pinch-Hold Selection
-    if landmarks and len(landmarks) >= 9:
-        x1, y1 = landmarks[4]  # Thumb tip
-        x2, y2 = landmarks[8]  # Index tip
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        dist = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+    while True:
+        dt = clock.tick(FPS) / 1000.0
+        t += dt
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE: return
 
-        # 🔄 Update hover (with glow/sound in Menu class)
-        menu.update_hover(cx, cy)
+        gf  = ge.get()
+        cx, cy = gf.cursor
+        active = back_rect.collidepoint(cx, cy) and gf.is_pinching
+        _, fired = hold.update("back", active)
+        if fired: return
 
-        # ✅ Detect press-and-hold gesture
-        if dist < 40:
-            selection = menu.update_selection_timer(cx, cy)
-            if selection:
-                print(f"✅ Selected: {selection}")
-                play_sound("assets/sounds/welcome.mp3")
+        screen.fill(Colors.BG_DEEP)
+        draw_stars_bg(screen, stars, t)
 
-                # 🚀 Launch the selected module
-                if selection == "Shapes & Colors":
-                    run_shapes_colors(cap, tracker)
-                elif selection == "Numbers":
-                    run_numbers(cap, tracker)  # ➕ Submenu with math modes
-                elif selection == "Counting":
-                    run_counting(cap, tracker)
-                elif selection == "Spellings":
-                    run_spellings(cap, tracker)
-                elif selection == "Drawing":
-                    run_drawing(cap, tracker)
-                elif selection == "Quit":
-                    break
+        # Safe zone overlay
+        _draw_safe_zone(screen)
 
-                time.sleep(1)  # ⏸ Prevent accidental re-entry
+        draw_text_centered(screen, name,
+                           Fonts.title(L.font_size(64)), Colors.TEXT_WHITE,
+                           (L.cx, L.cy - L.s(50)),
+                           shadow=True, shadow_color=(60, 30, 120))
+        draw_text_centered(screen, "Coming soon  🚀",
+                           Fonts.body(L.font_size(34)), Colors.TEXT_MUTED,
+                           (L.cx, L.cy + L.s(10)))
 
-    # ✋ Draw Hand Skeleton
-    tracker.draw_hand(frame)
+        rounded_rect(screen, back_rect, Colors.BG_CARD, radius=L.s(16),
+                     border_color=Colors.PURPLE_LIGHT if active else None)
+        draw_text_centered(screen, "← Back",
+                           Fonts.body(L.font_size(28)), Colors.TEXT_LIGHT,
+                           back_rect.center)
+        st = hold._start.get("back")
+        if st:
+            p = min((time.time() - st) / 1.5, 1.0)
+            hold_ring(screen, back_rect.center, L.s(36), p)
 
-    # 👀 Show App Window
-    cv2.imshow("🟦 Touchless Tutor", frame)
+        if gf.hand_visible:
+            draw_hand_skeleton(screen, gf.landmarks, gf.is_pinching)
+            if gf.is_pinching:
+                glow_circle(screen, (cx, cy), L.s(14), Colors.CYAN, layers=3)
+            else:
+                pygame.draw.circle(screen, Colors.TEXT_WHITE, (cx, cy), L.s(10), 2)
+                pygame.draw.circle(screen, Colors.CYAN, (cx, cy), L.s(4))
+        pygame.display.flip()
 
-    # 🔚 Exit Key
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
 
-# 🔒 Cleanup
-cap.release()
-cv2.destroyAllWindows()
+def _draw_safe_zone(screen):
+    """Subtle visual hint showing where UI lives vs gesture margin."""
+    from modules.ui.renderer import Colors
+    # Gesture border — very faint outer strip to show what's "gesture only"
+    border_surf = pygame.Surface((L.sw, L.sh), pygame.SRCALPHA)
+    # Outer full-screen rect
+    pygame.draw.rect(border_surf, (255, 255, 255, 8),
+                     (0, 0, L.sw, L.sh))
+    # Cut out the UI zone (make it slightly brighter)
+    pygame.draw.rect(border_surf, (255, 255, 255, 14),
+                     (L.ui_x, L.ui_y, L.ui_w, L.ui_h),
+                     border_radius=L.s(20))
+    # UI zone border line
+    pygame.draw.rect(border_surf, (255, 255, 255, 30),
+                     (L.ui_x, L.ui_y, L.ui_w, L.ui_h),
+                     width=1, border_radius=L.s(20))
+    screen.blit(border_surf, (0, 0))
+
+
+def main():
+    pygame.init()
+    pygame.display.set_caption(TITLE)
+
+    # ── Detect screen resolution and go fullscreen ─────────────────────────
+    info    = pygame.display.Info()
+    sw, sh  = info.current_w, info.current_h
+    # Windowed fullscreen (no mode switch, works on all displays)
+    screen  = pygame.display.set_mode((sw, sh), pygame.NOFRAME)
+
+    # Initialise the layout singleton — everything else reads from L
+    L.init(screen)
+    print(f"Display: {L}")
+
+    _loading_screen(screen, "Starting camera…")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        _loading_screen(screen, "Camera not found — check your webcam.")
+        pygame.time.wait(3000)
+        pygame.quit()
+        sys.exit(1)
+
+    _loading_screen(screen, "Loading hand tracker…")
+    # Gesture engine uses FULL screen dimensions — gestures work everywhere
+    ge = GestureEngine(cap, screen_w=L.sw, screen_h=L.sh, mirror=True)
+    _loading_screen(screen, "Ready!")
+    pygame.time.wait(400)
+
+    scene = "menu"
+    while True:
+        if scene == "menu":
+            scene = run_main_menu(screen, ge)
+        elif scene == "numbers":
+            run_addition(screen, ge)
+            scene = "menu"
+        elif scene in ("letters", "shapes", "drawing", "progress"):
+            labels = {"letters": "Letters", "shapes": "Shapes & Colors",
+                      "drawing": "Drawing", "progress": "Progress"}
+            _show_coming_soon(screen, ge, labels[scene])
+            scene = "menu"
+        elif scene == "quit" or scene is None:
+            break
+        else:
+            scene = "menu"
+
+    ge.stop()
+    cap.release()
+    pygame.quit()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
