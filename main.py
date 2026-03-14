@@ -6,7 +6,7 @@ if _ROOT not in sys.path:
 
 from modules.ui.layout import L
 from modules.gesture_engine import GestureEngine, HoldDetector
-from modules.progress_tracker import ProgressTracker
+from modules.progress_tracker import PT   # singleton — already initialised
 from main_menu import run_main_menu
 
 TITLE = "Touchless Tutor"
@@ -36,9 +36,6 @@ def main():
                                      pygame.NOFRAME)
     L.init(screen)
     print(f"Display: {L}")
-
-    # Progress tracker — single instance shared across all lessons
-    tracker = ProgressTracker()
 
     _loading_screen(screen, "Starting camera…")
     cap = cv2.VideoCapture(0)

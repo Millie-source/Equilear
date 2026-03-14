@@ -1,19 +1,5 @@
 # lessons/progress/screen.py
-"""
-Progress screen — visual reward map for kids and caregivers.
-
-Layout
-──────
-  Top:    title + overall stats bar
-  Middle: three panels side-by-side — Letters, Numbers, Shapes
-  Bottom: streak flame + total stars earned
-
-Data
-────
-  Reads from  data/progress.json  written by ProgressTracker.
-  If no data exists yet, all circles show as grey (not started).
-"""
-import pygame, math, random, time, json, os
+import pygame, math, random, time
 from modules.ui.layout import L
 from modules.ui.renderer import (
     Colors, Fonts, gradient_rect, glow_circle,
@@ -21,194 +7,174 @@ from modules.ui.renderer import (
     rounded_rect, particle_burst, draw_hand_skeleton,
 )
 from modules.gesture_engine import GestureEngine, HoldDetector
+from modules.progress_tracker import PT
 
-FPS        = 60
-DATA_PATH  = "data/progress.json"
+FPS = 60
 
-# ── Colour scheme ─────────────────────────────────────────────────────────────
-C_MASTERED   = ( 50, 220, 100)   # green  – all stages done
-C_STARTED    = ( 50, 180, 255)   # blue   – some progress
-C_UNTOUCHED  = ( 60,  55,  90)   # dark   – never tried
-C_GOLD       = (255, 210,  40)   # star / streak
-C_PANEL_BG   = ( 28,  24,  50)
-
-# ── Data helpers ──────────────────────────────────────────────────────────────
-def _load_progress() -> dict:
-    if os.path.exists(DATA_PATH):
-        try:
-            with open(DATA_PATH) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+# ── colour palette ────────────────────────────────────────────────────────────
+C_MASTERED  = ( 50, 220, 100)
+C_STARTED   = ( 50, 180, 255)
+C_UNTOUCHED = ( 55,  50,  85)
+C_GOLD      = (255, 210,  40)
+C_PANEL_BG  = ( 22,  18,  44)
 
 
-def _letter_status(data: dict) -> dict[str, str]:
-    """Returns {letter: 'mastered'|'started'|'untouched'} for A-Z."""
-    import string
-    result = {}
-    for letter in string.ascii_uppercase:
-        entry = data.get(letter, {})
-        hist  = entry.get("history", [])
-        stage = entry.get("stage", 1)
-        if not hist:
-            result[letter] = "untouched"
-        elif stage >= 5 and any(h.get("accuracy",0) >= 0.8
-                                for h in hist if h.get("stage",0) == 5):
-            result[letter] = "mastered"
-        else:
-            result[letter] = "started"
-    return result
-
-
-def _lesson_status(data: dict, lessons: list[str]) -> dict[str, str]:
-    """Returns {lesson: 'mastered'|'started'|'untouched'} for numeric lessons."""
-    result = {}
-    for lesson in lessons:
-        entry = data.get(f"lesson_{lesson}", {})
-        hist  = entry.get("history", [])
-        if not hist:
-            result[lesson] = "untouched"
-        elif entry.get("correct_streak", 0) >= 5:
-            result[lesson] = "mastered"
-        else:
-            result[lesson] = "started"
-    return result
-
-
+# ── drawing helpers ───────────────────────────────────────────────────────────
 def _status_color(status: str) -> tuple:
-    return {"mastered": C_MASTERED, "started": C_STARTED,
-            "untouched": C_UNTOUCHED}.get(status, C_UNTOUCHED)
+    return {
+        "mastered":  C_MASTERED,
+        "started":   C_STARTED,
+        "untouched": C_UNTOUCHED,
+    }.get(status, C_UNTOUCHED)
 
 
-# ── Star drawing ──────────────────────────────────────────────────────────────
-def _draw_star(surface, cx, cy, r, color, alpha=255):
+def _draw_star(surface, cx, cy, r, color):
     pts = []
     for k in range(10):
-        angle  = math.radians(-90 + k * 36)
+        a      = math.radians(-90 + k * 36)
         radius = r if k % 2 == 0 else r * 0.42
-        pts.append((int(cx + radius * math.cos(angle)),
-                    int(cy + radius * math.sin(angle))))
-    if alpha < 255:
-        surf = pygame.Surface((r*2+4, r*2+4), pygame.SRCALPHA)
-        shifted = [(x - cx + r + 2, y - cy + r + 2) for x, y in pts]
-        pygame.draw.polygon(surf, (*color, alpha), shifted)
-        surface.blit(surf, (cx - r - 2, cy - r - 2))
-    else:
-        pygame.draw.polygon(surface, color, pts)
+        pts.append((int(cx + radius * math.cos(a)),
+                    int(cy + radius * math.sin(a))))
+    pygame.draw.polygon(surface, color, pts)
 
 
-# ── Streak flame ──────────────────────────────────────────────────────────────
 def _draw_flame(surface, cx, cy, size, t):
-    """Animated flame for streak indicator."""
-    for layer, (col, scale, speed, phase) in enumerate([
-        ((255, 80,  20), 1.0, 3.0, 0.0),
+    for col, scale, speed, phase in [
+        ((255,  80, 20), 1.0, 3.0, 0.0),
         ((255, 160, 20), 0.7, 4.0, 0.5),
         ((255, 240, 80), 0.4, 5.0, 1.0),
-    ]):
+    ]:
         flicker = 0.85 + 0.15 * math.sin(t * speed + phase)
         w = int(size * scale * 0.6 * flicker)
         h = int(size * scale * flicker)
-        pts = [
-            (cx,          cy - h),
-            (cx - w,      cy),
-            (cx - w//2,   cy - h//3),
-            (cx,          cy - h//2),
-            (cx + w//2,   cy - h//3),
-            (cx + w,      cy),
-        ]
+        pts = [(cx, cy-h),(cx-w, cy),(cx-w//2, cy-h//3),
+               (cx, cy-h//2),(cx+w//2, cy-h//3),(cx+w, cy)]
         surf = pygame.Surface((size*3, size*3), pygame.SRCALPHA)
-        shifted = [(x - cx + size, y - cy + size) for x, y in pts]
-        pygame.draw.polygon(surf, (*col, 200 - layer*40), shifted)
-        surface.blit(surf, (cx - size, cy - size))
+        shifted = [(x-cx+size, y-cy+size) for x, y in pts]
+        pygame.draw.polygon(surf, (*col, 190), shifted)
+        surface.blit(surf, (cx-size, cy-size))
 
 
-# ── Panel drawing ─────────────────────────────────────────────────────────────
-def _draw_panel(surface, rect, title, items: list[dict], t: float):
+def _accuracy_label(detail: dict) -> str:
+    total   = detail.get("total_attempts", 0)
+    correct = detail.get("total_correct", 0)
+    if total == 0:
+        return "—"
+    pct = int(correct / total * 100)
+    return f"{pct}%  ({correct}/{total})"
+
+
+# ── panel drawing ─────────────────────────────────────────────────────────────
+def _draw_panel(surface, rect: pygame.Rect, title: str,
+                items: list[dict], detail: dict, t: float):
     """
-    Draw one subject panel.
-    items = [{"label": str, "status": str, "is_circle": bool}]
+    One subject panel.
+    items  = [{"label": str, "status": str, "circle": bool}]
+    detail = {lesson_id: get_lesson() dict}  — for tooltip stats
     """
-    # Panel background
-    rounded_rect(surface, rect, C_PANEL_BG, radius=L.s(18),
-                 border_color=(80, 70, 120), border_width=1)
+    rounded_rect(surface, rect, C_PANEL_BG, radius=L.s(16),
+                 border_color=(70, 60, 110), border_width=1)
 
     # Panel title
     draw_text_centered(surface, title,
-                       Fonts.body(L.font_size(26)), Colors.TEXT_WHITE,
-                       (rect.centerx, rect.y + L.s(28)))
+                       Fonts.body(L.font_size(24)), Colors.TEXT_WHITE,
+                       (rect.centerx, rect.y + L.s(26)))
 
-    # Count mastered
+    # Mastered count + mini bar
     n_mastered = sum(1 for it in items if it["status"] == "mastered")
+    n_started  = sum(1 for it in items if it["status"] == "started")
     n_total    = len(items)
-    pct_text   = f"{n_mastered}/{n_total}"
-    draw_text_centered(surface, pct_text,
-                       Fonts.label(L.font_size(18)), Colors.TEXT_MUTED,
-                       (rect.centerx, rect.y + L.s(50)))
 
-    # Mini progress bar
-    bar_rect = pygame.Rect(rect.x + L.s(16), rect.y + L.s(60),
-                           rect.w - L.s(32), L.s(8))
-    pygame.draw.rect(surface, (50, 44, 80), bar_rect, border_radius=L.s(4))
-    if n_total > 0:
-        fill_w = int(bar_rect.w * n_mastered / n_total)
-        if fill_w > 0:
-            fill = pygame.Rect(bar_rect.x, bar_rect.y, fill_w, bar_rect.h)
-            pygame.draw.rect(surface, C_MASTERED, fill, border_radius=L.s(4))
+    count_txt = f"{n_mastered}/{n_total}  mastered"
+    draw_text_centered(surface, count_txt,
+                       Fonts.label(L.font_size(16)), Colors.TEXT_MUTED,
+                       (rect.centerx, rect.y + L.s(48)))
 
-    # Items grid
-    n      = len(items)
-    cols   = min(n, 9)
-    rows   = math.ceil(n / cols)
-    gap    = L.s(6)
-    item_w = (rect.w - L.s(20) - gap*(cols-1)) // cols
-    item_h = item_w
-    grid_h = rows * item_h + (rows-1) * gap
-    gy     = rect.centery - grid_h//2 + L.s(20)
-    gx     = rect.x + L.s(10)
+    bar = pygame.Rect(rect.x + L.s(14), rect.y + L.s(58),
+                      rect.w - L.s(28), L.s(7))
+    pygame.draw.rect(surface, (40, 36, 70), bar, border_radius=L.s(4))
+    if n_total:
+        # mastered segment
+        if n_mastered:
+            fw = int(bar.w * n_mastered / n_total)
+            pygame.draw.rect(surface, C_MASTERED,
+                             pygame.Rect(bar.x, bar.y, fw, bar.h),
+                             border_radius=L.s(4))
+        # started segment
+        if n_started:
+            sw_ = int(bar.w * n_started / n_total)
+            sx_ = bar.x + int(bar.w * n_mastered / n_total)
+            started_surf = pygame.Surface((sw_, bar.h), pygame.SRCALPHA)
+            pygame.draw.rect(started_surf, (*C_STARTED, 160),
+                             started_surf.get_rect(), border_radius=L.s(4))
+            surface.blit(started_surf, (sx_, bar.y))
+
+    # ── item grid ─────────────────────────────────────────────────────────
+    n     = len(items)
+    if n == 0:
+        return
+    cols  = min(n, 9)
+    rows  = math.ceil(n / cols)
+    gap   = L.s(5)
+    iw    = (rect.w - L.s(18) - gap * (cols - 1)) // cols
+    ih    = iw
+    gh    = rows * ih + (rows - 1) * gap
+    avail_top = rect.y + L.s(72)
+    avail_bot = rect.bottom - L.s(8)
+    avail_h   = avail_bot - avail_top
+    # If grid is taller than available, shrink items
+    if gh > avail_h:
+        ih = (avail_h - gap * (rows - 1)) // rows
+        iw = ih
+        gh = rows * ih + (rows - 1) * gap
+    gy = avail_top + (avail_h - gh) // 2
+    gx = rect.x + L.s(9)
 
     for i, item in enumerate(items):
-        col  = i % cols
-        row  = i // cols
-        ix   = gx + col * (item_w + gap)
-        iy   = gy + row * (item_h + gap)
-        icx  = ix + item_w//2
-        icy  = iy + item_h//2
-        r    = item_w // 2 - L.s(2)
+        col = i % cols
+        row = i // cols
+        ix  = gx + col * (iw + gap)
+        iy  = gy + row * (ih + gap)
+        icx = ix + iw // 2
+        icy = iy + ih // 2
+        r   = max(4, iw // 2 - L.s(1))
         col_ = _status_color(item["status"])
 
-        if item.get("is_circle", True):
-            # Circle bubble
+        if item.get("circle", True):
             if item["status"] == "mastered":
-                glow_circle(surface, (icx, icy), r, col_, layers=2)
+                gc = pygame.Surface((r*2+8, r*2+8), pygame.SRCALPHA)
+                pygame.draw.circle(gc, (*col_, 60), (r+4, r+4), r+4)
+                surface.blit(gc, (icx-r-4, icy-r-4))
             pygame.draw.circle(surface, col_, (icx, icy), r)
-            pygame.draw.circle(surface, (255,255,255),
-                               (icx, icy), r, max(1, L.s(1)))
-
-            # Star badge for mastered
+            pygame.draw.circle(surface, (255,255,255), (icx,icy), r, 1)
             if item["status"] == "mastered":
-                _draw_star(surface, icx + r - L.s(4), icy - r + L.s(4),
-                           L.s(7), C_GOLD)
-
-            # Label inside circle
-            if item_w >= L.s(28):
-                lf = Fonts.label(L.font_size(14))
-                tc = (20, 20, 20) if item["status"] != "untouched" else (140, 130, 180)
+                _draw_star(surface, icx+r-L.s(3), icy-r+L.s(3), L.s(6), C_GOLD)
+            if iw >= L.s(24):
+                lf = Fonts.label(L.font_size(13))
+                tc = (15,15,15) if item["status"] != "untouched" else (120,110,160)
                 draw_text_centered(surface, item["label"], lf, tc, (icx, icy))
         else:
-            # Rectangle pill for longer labels
-            pill = pygame.Rect(ix, iy, item_w, item_h)
-            rounded_rect(surface, pill, col_, radius=L.s(8))
+            pill = pygame.Rect(ix, iy, iw, ih)
+            rounded_rect(surface, pill, col_, radius=L.s(7))
             if item["status"] == "mastered":
-                _draw_star(surface, pill.right - L.s(6), pill.y + L.s(6),
-                           L.s(6), C_GOLD)
-            lf = Fonts.label(L.font_size(13))
-            tc = (20, 20, 20) if item["status"] != "untouched" else (140, 130, 180)
-            draw_text_centered(surface, item["label"], lf, tc,
-                               (icx, icy))
+                _draw_star(surface, pill.right-L.s(5), pill.y+L.s(5),
+                           L.s(5), C_GOLD)
+            if item["status"] != "untouched":
+                d   = detail.get(item["id"], {})
+                acc = _accuracy_label(d)
+                draw_text_centered(surface, item["label"],
+                                   Fonts.label(L.font_size(12)),
+                                   (15,15,15), (icx, icy - L.s(6)))
+                draw_text_centered(surface, acc,
+                                   Fonts.label(L.font_size(10)),
+                                   (10,10,10), (icx, icy + L.s(7)))
+            else:
+                draw_text_centered(surface, item["label"],
+                                   Fonts.label(L.font_size(12)),
+                                   (120,110,160), (icx, icy))
 
 
-# ── Main progress screen ──────────────────────────────────────────────────────
+# ── main screen ───────────────────────────────────────────────────────────────
 class ProgressScreen:
 
     NUMBER_LESSONS = ["addition", "subtraction", "multiplication",
@@ -216,21 +182,27 @@ class ProgressScreen:
     SHAPE_LESSONS  = ["shapes", "colors"]
 
     def __init__(self, ge: GestureEngine):
-        self.ge         = ge
-        self.back_hold  = HoldDetector(1.5)
-        self._clock     = pygame.time.Clock()
-        self.t          = 0.0
-        self.particles  = []
-        self.stars      = [(random.randint(0, L.sw), random.randint(0, L.sh),
-                            random.randint(1, 2), random.uniform(0, 6.28))
-                           for _ in range(80)]
-        # Load once; could reload on each entry for live updates
-        self._data      = _load_progress()
-        self._letter_st = _letter_status(self._data)
-        self._num_st    = _lesson_status(self._data, self.NUMBER_LESSONS)
-        self._shape_st  = _lesson_status(self._data, self.SHAPE_LESSONS)
+        self.ge        = ge
+        self.back_hold = HoldDetector(1.5)
+        self._clock    = pygame.time.Clock()
+        self.t         = 0.0
+        self.particles = []
+        self.stars     = [(random.randint(0, L.sw), random.randint(0, L.sh),
+                           random.randint(1, 2), random.uniform(0, 6.28))
+                          for _ in range(80)]
+        self._scroll_y = 0
+        self._load_data()
 
-        # Compute overall stats
+    def _load_data(self):
+        """Reload fresh from PT singleton every time screen opens."""
+        stats = PT.all_stats()
+        self._letter_st  = stats["letters"]
+        self._num_st     = stats["lessons"]
+        self._shape_st   = stats["shapes"]
+        self._detail     = stats["lesson_detail"]
+        self._streak     = stats["streak"]
+        self._stars      = stats["total_stars"]
+
         self._total_mastered = (
             sum(1 for s in self._letter_st.values()  if s == "mastered") +
             sum(1 for s in self._num_st.values()     if s == "mastered") +
@@ -239,16 +211,14 @@ class ProgressScreen:
         self._total_items = (
             len(self._letter_st) + len(self._num_st) + len(self._shape_st)
         )
-        self._streak = self._data.get("_streak", 0)
-
-        # Celebration particles on entry if anything mastered
+        # Celebrate if anything mastered
         if self._total_mastered > 0:
-            for _ in range(3):
+            for _ in range(min(self._total_mastered, 5)):
                 self.particles += self._emit_celebrate()
 
     def _emit_celebrate(self):
         cx = random.randint(L.ui_x, L.ui_right)
-        cy = random.randint(L.ui_y, L.ui_bottom // 2)
+        cy = random.randint(L.ui_y, L.cy)
         color = random.choice([C_MASTERED, C_GOLD, Colors.CYAN, Colors.PURPLE])
         return [{"x": cx, "y": cy,
                  "vx": math.cos(a)*s, "vy": math.sin(a)*s - 100,
@@ -257,13 +227,15 @@ class ProgressScreen:
                  "size": random.randint(L.s(4), L.s(10))}
                 for a, s in [(random.uniform(0, math.pi*2),
                                random.uniform(60, 200))
-                              for _ in range(12)]]
+                              for _ in range(10)]]
 
     def run(self, screen) -> str:
+        # Always reload on entry so data is fresh
+        self._load_data()
+
         while True:
             dt = self._clock.tick(FPS) / 1000.0
             self.t += dt
-
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:  return "back"
                 if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
@@ -274,7 +246,7 @@ class ProgressScreen:
 
             br = pygame.Rect(L.ui_x, L.ui_y, L.s(130), L.s(54))
             _, fired = self.back_hold.update(
-                "back", br.collidepoint(cx,cy) and gf.is_pinching)
+                "back", br.collidepoint(cx, cy) and gf.is_pinching)
             if fired:
                 return "back"
 
@@ -288,28 +260,27 @@ class ProgressScreen:
         screen.fill(Colors.BG_DEEP)
 
         # Nebula background
-        for i, (bx, by, br, bc) in enumerate([
-            (int(L.sw*.2), int(L.sh*.3), L.s(200), (60,20,140)),
-            (int(L.sw*.8), int(L.sh*.7), L.s(180), (20,60,160)),
-            (int(L.sw*.5), int(L.sh*.5), L.s(160), (80,20,80)),
+        for i, (bx,by,br,bc) in enumerate([
+            (int(L.sw*.2), int(L.sh*.3), L.s(200), (50,15,130)),
+            (int(L.sw*.8), int(L.sh*.7), L.s(180), (15,50,150)),
+            (int(L.sw*.5), int(L.sh*.5), L.s(140), (70,15,70)),
         ]):
-            ox = int(L.s(12)*math.sin(self.t*.3+i))
-            oy = int(L.s(8)*math.cos(self.t*.25+i))
+            ox = int(L.s(10)*math.sin(self.t*.3+i))
+            oy = int(L.s(7)*math.cos(self.t*.25+i))
             bl = pygame.Surface((br*2, br*2), pygame.SRCALPHA)
-            pygame.draw.circle(bl, (*bc, 28), (br, br), br)
+            pygame.draw.circle(bl, (*bc, 25), (br,br), br)
             screen.blit(bl, (bx-br+ox, by-br+oy))
 
         draw_stars_bg(screen, self.stars, self.t)
 
         # Safe zone
         ov = pygame.Surface((L.sw, L.sh), pygame.SRCALPHA)
-        pygame.draw.rect(ov, (255,255,255,12),
-                         (L.ui_x, L.ui_y, L.ui_w, L.ui_h),
-                         border_radius=L.s(20))
-        pygame.draw.rect(ov, (255,255,255,28),
-                         (L.ui_x, L.ui_y, L.ui_w, L.ui_h),
+        pygame.draw.rect(ov,(255,255,255,12),
+                         (L.ui_x,L.ui_y,L.ui_w,L.ui_h), border_radius=L.s(20))
+        pygame.draw.rect(ov,(255,255,255,26),
+                         (L.ui_x,L.ui_y,L.ui_w,L.ui_h),
                          width=1, border_radius=L.s(20))
-        screen.blit(ov, (0,0))
+        screen.blit(ov,(0,0))
 
         # Back button
         br   = pygame.Rect(L.ui_x, L.ui_y, L.s(130), L.s(54))
@@ -329,105 +300,117 @@ class ProgressScreen:
         # Title
         y_title = L.ui_y + L.s(36)
         draw_text_centered(screen, "My Progress",
-                           Fonts.title(L.font_size(52)), Colors.TEXT_WHITE,
+                           Fonts.title(L.font_size(50)), Colors.TEXT_WHITE,
                            (L.cx, y_title),
-                           shadow=True, shadow_color=(60,30,120))
+                           shadow=True, shadow_color=(50,25,110))
 
-        # Overall progress bar
-        bar_y  = y_title + L.s(42)
-        bar_w  = int(L.ui_w * 0.6)
-        bar_h  = L.s(16)
+        # ── Overall bar ────────────────────────────────────────────────────
+        bar_y  = y_title + L.s(44)
+        bar_w  = int(L.ui_w * 0.55)
+        bar_h  = L.s(14)
         bar_x  = L.cx - bar_w // 2
-        bar_rect = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
-        pygame.draw.rect(screen, (50,44,80), bar_rect, border_radius=L.s(8))
-        if self._total_items > 0 and self._total_mastered > 0:
+        bar_r  = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
+        pygame.draw.rect(screen, (44,38,74), bar_r, border_radius=L.s(7))
+        if self._total_mastered and self._total_items:
             fw = int(bar_w * self._total_mastered / self._total_items)
             pygame.draw.rect(screen, C_MASTERED,
                              pygame.Rect(bar_x, bar_y, fw, bar_h),
-                             border_radius=L.s(8))
+                             border_radius=L.s(7))
         draw_text_centered(
             screen,
-            f"{self._total_mastered} of {self._total_items} topics mastered",
-            Fonts.label(L.font_size(20)), Colors.TEXT_MUTED,
+            f"{self._total_mastered} / {self._total_items} topics mastered",
+            Fonts.label(L.font_size(18)), Colors.TEXT_MUTED,
             (L.cx, bar_y + bar_h + L.s(14)))
 
-        # Streak
+        # ── Streak & stars ─────────────────────────────────────────────────
         if self._streak > 0:
-            sx = L.ui_right - L.s(80)
+            sx = L.ui_right - L.s(70)
             sy = y_title
-            _draw_flame(screen, sx, sy, L.s(32), self.t)
-            draw_text_centered(screen, f"{self._streak}",
-                               Fonts.title(L.font_size(32)), C_GOLD,
-                               (sx, sy + L.s(36)))
+            _draw_flame(screen, sx, sy, L.s(28), self.t)
+            draw_text_centered(screen, str(self._streak),
+                               Fonts.title(L.font_size(30)), C_GOLD,
+                               (sx, sy + L.s(34)))
             draw_text_centered(screen, "day streak",
-                               Fonts.label(L.font_size(16)), Colors.TEXT_MUTED,
-                               (sx, sy + L.s(52)))
+                               Fonts.label(L.font_size(14)), Colors.TEXT_MUTED,
+                               (sx, sy + L.s(50)))
 
-        # ── Three subject panels ───────────────────────────────────────────
-        panel_y  = bar_y + bar_h + L.s(46)
-        panel_h  = L.ui_bottom - panel_y - L.s(10)
-        gap      = L.s(16)
-        panel_w  = (L.ui_w - gap * 2) // 3
+        if self._stars > 0:
+            stx = L.ui_right - L.s(140)
+            sty = y_title + L.s(8)
+            ef  = pygame.font.SysFont("Segoe UI Emoji", L.font_size(24))
+            ss  = ef.render("⭐", True, C_GOLD)
+            screen.blit(ss, ss.get_rect(center=(stx, sty)))
+            draw_text_centered(screen, f"×{self._stars}",
+                               Fonts.body(L.font_size(22)), C_GOLD,
+                               (stx + L.s(22), sty))
 
-        panels = [
-            {
-                "title": "Letters  🔤",
-                "rect":  pygame.Rect(L.ui_x, panel_y, panel_w, panel_h),
-                "items": [{"label": lt, "status": self._letter_st[lt],
-                           "is_circle": True}
-                          for lt in sorted(self._letter_st)],
-            },
-            {
-                "title": "Numbers  🔢",
-                "rect":  pygame.Rect(L.ui_x + panel_w + gap, panel_y,
-                                     panel_w, panel_h),
-                "items": [{"label": n.replace("_"," ").title(),
-                           "status": self._num_st[n], "is_circle": False}
-                          for n in self.NUMBER_LESSONS],
-            },
-            {
-                "title": "Shapes & Colors  🔷",
-                "rect":  pygame.Rect(L.ui_x + (panel_w + gap)*2, panel_y,
-                                     panel_w, panel_h),
-                "items": [{"label": s.title(),
-                           "status": self._shape_st[s], "is_circle": False}
-                          for s in self.SHAPE_LESSONS],
-            },
+        # ── Three panels ───────────────────────────────────────────────────
+        panel_y = bar_y + bar_h + L.s(48)
+        panel_h = L.ui_bottom - panel_y - L.s(8)
+        gap     = L.s(14)
+        panel_w = (L.ui_w - gap * 2) // 3
+
+        # Letters panel
+        letter_items = [
+            {"label": lt, "status": self._letter_st[lt], "circle": True}
+            for lt in sorted(self._letter_st)
         ]
+        letters_rect = pygame.Rect(L.ui_x, panel_y, panel_w, panel_h)
+        _draw_panel(screen, letters_rect, "Letters  🔤",
+                    letter_items, {}, self.t)
 
-        for panel in panels:
-            _draw_panel(screen, panel["rect"], panel["title"],
-                        panel["items"], self.t)
+        # Numbers panel
+        num_labels = {
+            "addition": "Add", "subtraction": "Sub",
+            "multiplication": "Mul", "division": "Div",
+            "counting": "Count", "odd_even": "Odd/Even",
+            "fill_missing": "Fill",
+        }
+        num_items = [
+            {"label": num_labels.get(l, l), "id": l,
+             "status": self._num_st[l], "circle": False}
+            for l in self.NUMBER_LESSONS
+        ]
+        nums_rect = pygame.Rect(L.ui_x + panel_w + gap, panel_y,
+                                panel_w, panel_h)
+        _draw_panel(screen, nums_rect, "Numbers  🔢",
+                    num_items, self._detail, self.t)
 
-        # Legend
-        leg_y = L.ui_bottom - L.s(6)
+        # Shapes panel
+        shape_items = [
+            {"label": l.title(), "id": l,
+             "status": self._shape_st[l], "circle": False}
+            for l in self.SHAPE_LESSONS
+        ]
+        shapes_rect = pygame.Rect(L.ui_x + (panel_w + gap)*2, panel_y,
+                                  panel_w, panel_h)
+        _draw_panel(screen, shapes_rect, "Shapes & Colors  🔷",
+                    shape_items, self._detail, self.t)
+
+        # ── Legend ─────────────────────────────────────────────────────────
+        leg_y = L.ui_bottom - L.s(8)
         for color, label, lx in [
-            (C_MASTERED,  "Mastered", L.ui_x),
-            (C_STARTED,   "Started",  L.ui_x + L.s(130)),
-            (C_UNTOUCHED, "Not yet",  L.ui_x + L.s(250)),
+            (C_MASTERED,  "Mastered",    L.ui_x),
+            (C_STARTED,   "In progress", L.ui_x + L.s(120)),
+            (C_UNTOUCHED, "Not started", L.ui_x + L.s(260)),
         ]:
-            pygame.draw.circle(screen, color,
-                               (lx + L.s(8), leg_y), L.s(7))
+            pygame.draw.circle(screen, color, (lx+L.s(7), leg_y), L.s(6))
             draw_text_centered(screen, label,
-                               Fonts.label(L.font_size(16)),
-                               Colors.TEXT_MUTED,
-                               (lx + L.s(46), leg_y))
+                               Fonts.label(L.font_size(15)), Colors.TEXT_MUTED,
+                               (lx + L.s(44), leg_y))
 
-        # Particles
         self.particles = particle_burst(screen, self.particles, 0)
 
-        # Cursor + skeleton
+        # Cursor
         if gf.hand_visible:
             draw_hand_skeleton(screen, gf.landmarks, gf.is_pinching)
             pcx, pcy = gf.cursor
             if gf.is_pinching:
                 glow_circle(screen, (pcx,pcy), L.s(14), Colors.CYAN, layers=3)
             else:
-                pygame.draw.circle(screen, Colors.TEXT_WHITE,
-                                   (pcx,pcy), L.s(10), 2)
+                pygame.draw.circle(screen, Colors.TEXT_WHITE, (pcx,pcy), L.s(10), 2)
                 pygame.draw.circle(screen, Colors.CYAN, (pcx,pcy), L.s(4))
 
 
-# ── Public entry ──────────────────────────────────────────────────────────────
 def run_progress(screen, ge: GestureEngine) -> str:
     return ProgressScreen(ge).run(screen)

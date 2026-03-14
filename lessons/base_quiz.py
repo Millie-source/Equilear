@@ -165,17 +165,16 @@ class BaseQuiz:
                 # ── Auto-record to ProgressTracker ─────────────────────
                 if self.lesson_id:
                     try:
-                        from modules.progress_tracker import ProgressTracker
-                        ProgressTracker().record_lesson(self.lesson_id,
-                                                        is_correct)
+                        from modules.progress_tracker import PT
+                        PT.record_lesson(self.lesson_id, is_correct)
                         # Check if difficulty level just changed
                         from modules.difficulty import DM
                         new_diff = DM.params(self.lesson_id)
                         if new_diff["level"] > self.difficulty["level"]:
-                            self.difficulty  = new_diff
-                            self._level_up   = True
-                    except Exception:
-                        pass
+                            self.difficulty = new_diff
+                            self._level_up  = True
+                    except Exception as e:
+                        print(f"[Progress] record failed: {e}")
 
                 if is_correct:
                     self.state      = "correct"

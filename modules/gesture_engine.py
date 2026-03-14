@@ -11,7 +11,7 @@ from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
 
 import os, urllib.request
 
-# ── download model once ────────────────────────────────────────────────────
+# ── model ─────────────────────────────────────────────────────────────────────
 MODEL_PATH = "hand_landmarker.task"
 MODEL_URL  = ("https://storage.googleapis.com/mediapipe-models/"
               "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
@@ -22,7 +22,7 @@ def _ensure_model():
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Download complete.")
 
-# ── hand connections for debug skeleton ───────────────────────────────────
+# ── hand connections ───────────────────────────────────────────────────────────
 _HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
     (0,5),(5,6),(6,7),(7,8),
@@ -32,9 +32,17 @@ _HAND_CONNECTIONS = [
     (5,9),(9,13),(13,17),
 ]
 
-PINCH_THRESHOLD  = 0.28   # normalised — real pinch ~0.20-0.26, open hand ~0.5+
-SMOOTHING        = 0.18   # EMA factor — lower = smoother but slightly laggier
-SMOOTHING_PINCH  = 0.10   # extra dampening when pinching (fingers touching = more noise)
+# ── tuning ─────────────────────────────────────────────────────────────────────
+PINCH_THRESHOLD   = 0.28   # normalised pinch distance
+SMOOTHING         = 0.18   # EMA for open hand
+SMOOTHING_PINCH   = 0.10   # EMA for pinching (fingers occlude = more noise)
+
+# Ghost persistence — how many seconds to keep showing the last known hand
+# after detection drops out.  Eliminates flicker entirely for brief dropouts.
+GHOST_SECONDS     = 0.18
+
+# Camera target FPS — cap read loop to avoid hammering the detector
+CAM_FPS           = 30
 
 
 class GestureState:
@@ -44,7 +52,7 @@ class GestureState:
     OPEN_PALM = "OPEN_PALM"
     THUMBS_UP = "THUMBS_UP"
     FINGERS_N = "FINGERS_N"
-    FIST      = "FIST"       # all fingers curled — use for drag/scroll
+    FIST      = "FIST"
 
 
 class GestureFrame:
@@ -54,19 +62,16 @@ class GestureFrame:
         self.finger_count = 0
         self.landmarks    = []
         self.hand_visible = False
-        self.wrist_y      = 0    # raw wrist Y in screen pixels (for scroll drag)
+        self.wrist_y      = 0
+        self.is_ghost     = False   # True when using last-known position
 
     @property
-    def is_pinching(self):
-        return self.state == GestureState.PINCHING
-
+    def is_pinching(self):  return self.state == GestureState.PINCHING
     @property
-    def is_pointing(self):
-        return self.state in (GestureState.POINTING, GestureState.PINCHING)
-
+    def is_pointing(self):  return self.state in (GestureState.POINTING,
+                                                   GestureState.PINCHING)
     @property
-    def is_fist(self):
-        return self.state == GestureState.FIST
+    def is_fist(self):      return self.state == GestureState.FIST
 
 
 class GestureEngine:
@@ -75,131 +80,178 @@ class GestureEngine:
         self.sw       = screen_w
         self.sh       = screen_h
         self.mirror   = mirror
-        self._latest  = GestureFrame()
         self._lock    = threading.Lock()
         self._running = True
-        self._smooth  = None
+
+        # Smoothing state
+        self._smooth    = None
+        self._smooth_lm = None
+
+        # Ghost: hold the last real frame for GHOST_SECONDS after dropout
+        self._last_real_gf   = GestureFrame()
+        self._last_real_time = 0.0
+
+        # Published frame (what get() returns)
+        self._latest = GestureFrame()
 
         _ensure_model()
 
+        # ── Use VIDEO mode: temporal tracking, far fewer dropouts ─────────
         opts = HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=mp_vision.RunningMode.IMAGE,
+            running_mode=mp_vision.RunningMode.VIDEO,  # KEY CHANGE
             num_hands=1,
-            min_hand_detection_confidence=0.7,
-            min_hand_presence_confidence=0.6,
-            min_tracking_confidence=0.6,
+            min_hand_detection_confidence=0.5,   # lowered: easier to first-find
+            min_hand_presence_confidence=0.4,    # lowered: easier to keep tracking
+            min_tracking_confidence=0.4,         # lowered: fewer mid-track drops
         )
         self._landmarker = HandLandmarker.create_from_options(opts)
+        self._frame_ts_ms = 0   # monotonic timestamp for VIDEO mode
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
+    # ── background capture loop ────────────────────────────────────────────
     def _loop(self):
+        frame_interval = 1.0 / CAM_FPS
+
         while self._running:
+            t0 = time.time()
+
             ret, raw = self.cap.read()
             if not ret:
                 time.sleep(0.01)
                 continue
+
             if self.mirror:
                 raw = cv2.flip(raw, 1)
+
             rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+
             try:
+                # VIDEO mode requires a monotonically increasing timestamp in ms
+                self._frame_ts_ms += int(frame_interval * 1000)
                 mp_img = Image(image_format=ImageFormat.SRGB, data=rgb)
-                result = self._landmarker.detect(mp_img)
-                hands  = []
+                result = self._landmarker.detect_for_video(
+                    mp_img, self._frame_ts_ms)
+                hands = []
                 if result.hand_landmarks:
                     hands = [[(lm.x, lm.y) for lm in hand]
                              for hand in result.hand_landmarks]
-            except Exception as e:
+            except Exception:
                 hands = []
-            gf = self._parse(hands)
+
+            now = time.time()
+            gf  = self._parse(hands, now)
+
             with self._lock:
                 self._latest = gf
 
-    def _parse(self, hands: list) -> GestureFrame:
-        gf = GestureFrame()
-        if not hands:
-            self._smooth    = None
-            self._smooth_lm = None
-            gf.cursor = (self.sw // 2, self.sh // 2)
+            # Pace the loop — don't burn CPU faster than the camera delivers
+            elapsed = time.time() - t0
+            sleep   = frame_interval - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
+
+    # ── parse raw landmarks into a GestureFrame ────────────────────────────
+    def _parse(self, hands: list, now: float) -> GestureFrame:
+
+        if hands:
+            # ── Real detection ─────────────────────────────────────────────
+            MARGIN = 0.15
+            def remap(v, lo, hi, out):
+                return int((max(lo, min(hi, v)) - lo) / (hi - lo) * out)
+
+            lm = [(remap(x, MARGIN, 1.0 - MARGIN, self.sw),
+                   remap(y, MARGIN, 1.0 - MARGIN, self.sh))
+                  for x, y in hands[0]]
+
+            # Smooth all landmarks
+            if self._smooth_lm is None:
+                self._smooth_lm = lm[:]
+            else:
+                self._smooth_lm = [
+                    (int(self._smooth_lm[i][0]
+                         + SMOOTHING * (lm[i][0] - self._smooth_lm[i][0])),
+                     int(self._smooth_lm[i][1]
+                         + SMOOTHING * (lm[i][1] - self._smooth_lm[i][1])))
+                    for i in range(len(lm))
+                ]
+
+            # Pinch
+            hand_size  = math.hypot(lm[0][0]-lm[9][0], lm[0][1]-lm[9][1])
+            pinch_dist = math.hypot(lm[4][0]-lm[8][0], lm[4][1]-lm[8][1])
+            norm_pinch = pinch_dist / max(hand_size, 1)
+            is_pinch   = norm_pinch < PINCH_THRESHOLD
+
+            # Smooth cursor
+            raw_cur = ((lm[4][0] + lm[8][0]) // 2,
+                       (lm[4][1] + lm[8][1]) // 2)
+            factor = SMOOTHING_PINCH if is_pinch else SMOOTHING
+            if self._smooth is None:
+                self._smooth = raw_cur
+            else:
+                sx = self._smooth[0] + factor * (raw_cur[0] - self._smooth[0])
+                sy = self._smooth[1] + factor * (raw_cur[1] - self._smooth[1])
+                self._smooth = (int(sx), int(sy))
+
+            # Gesture classification
+            tips = [8, 12, 16, 20]; pips = [6, 10, 14, 18]
+            extended  = [lm[t][1] < lm[p][1] for t, p in zip(tips, pips)]
+            count     = sum(extended)
+            thumb_ext = math.hypot(lm[4][0]-lm[5][0],
+                                   lm[4][1]-lm[5][1]) > hand_size * 0.45
+
+            gf = GestureFrame()
+            gf.hand_visible = True
+            gf.landmarks    = self._smooth_lm
+            gf.cursor       = self._smooth
+            gf.wrist_y      = lm[0][1]
+            gf.is_ghost     = False
+
+            if norm_pinch < PINCH_THRESHOLD:
+                gf.state = GestureState.PINCHING
+            elif all(extended) and thumb_ext:
+                gf.state = GestureState.OPEN_PALM
+            elif not any(extended) and not thumb_ext:
+                gf.state = GestureState.FIST
+            elif not any(extended) and thumb_ext:
+                gf.state = GestureState.THUMBS_UP
+            elif extended[0] and not any(extended[1:]):
+                gf.state = GestureState.POINTING
+            elif count > 0:
+                gf.state        = GestureState.FINGERS_N
+                gf.finger_count = count
+            else:
+                gf.state = GestureState.IDLE
+
+            # Save as last known real frame
+            self._last_real_gf   = gf
+            self._last_real_time = now
             return gf
 
-        # ── Safe-zone remapping ───────────────────────────────────────────
-        # The camera sees the full frame but hands near edges go out of shot.
-        # We remap the central 70% of the camera (15%–85%) to fill the full
-        # screen, so the child never needs to point at the physical edge.
-        MARGIN = 0.15   # ignore outer 15% of camera on each side
-
-        def remap(v: float, lo: float, hi: float, out: int) -> int:
-            clamped = max(lo, min(hi, v))
-            return int((clamped - lo) / (hi - lo) * out)
-
-        lm = [
-            (remap(x, MARGIN, 1.0 - MARGIN, self.sw),
-             remap(y, MARGIN, 1.0 - MARGIN, self.sh))
-            for x, y in hands[0]
-        ]
-
-        gf.hand_visible = True
-        gf.wrist_y      = lm[0][1]   # raw wrist Y for scroll tracking
-
-        # Smooth all 21 landmarks — reduces skeleton jitter visually
-        if not hasattr(self, '_smooth_lm') or self._smooth_lm is None:
-            self._smooth_lm = lm[:]
         else:
-            self._smooth_lm = [
-                (int(self._smooth_lm[i][0] + SMOOTHING * (lm[i][0] - self._smooth_lm[i][0])),
-                 int(self._smooth_lm[i][1] + SMOOTHING * (lm[i][1] - self._smooth_lm[i][1])))
-                for i in range(len(lm))
-            ]
-        gf.landmarks = self._smooth_lm
+            # ── No detection — use ghost if within grace window ────────────
+            age = now - self._last_real_time
+            if age < GHOST_SECONDS and self._last_real_gf.hand_visible:
+                ghost          = GestureFrame()
+                ghost.__dict__ = dict(self._last_real_gf.__dict__)
+                ghost.is_ghost = True
+                # Ghost never fires pinch — prevents phantom selections
+                if ghost.state == GestureState.PINCHING:
+                    ghost.state = GestureState.POINTING
+                return ghost
 
-        # Pinch distance — compute on raw lm (not smoothed) for accurate detection
-        hand_size  = math.hypot(lm[0][0]-lm[9][0], lm[0][1]-lm[9][1])
-        pinch_dist = math.hypot(lm[4][0]-lm[8][0], lm[4][1]-lm[8][1])
-        norm_pinch = pinch_dist / max(hand_size, 1)
-        is_pinch   = norm_pinch < PINCH_THRESHOLD
+            # Ghost expired — truly no hand
+            self._smooth    = None
+            self._smooth_lm = None
+            gf = GestureFrame()
+            gf.cursor = (self._last_real_gf.cursor
+                         if self._last_real_gf.hand_visible
+                         else (self.sw // 2, self.sh // 2))
+            return gf
 
-        # Cursor: midpoint of thumb+index, with stronger smoothing when pinching
-        raw_cur = ((lm[4][0] + lm[8][0]) // 2,
-                   (lm[4][1] + lm[8][1]) // 2)
-        factor = SMOOTHING_PINCH if is_pinch else SMOOTHING
-        if self._smooth is None:
-            self._smooth = raw_cur
-        else:
-            sx = self._smooth[0] + factor * (raw_cur[0] - self._smooth[0])
-            sy = self._smooth[1] + factor * (raw_cur[1] - self._smooth[1])
-            self._smooth = (int(sx), int(sy))
-        gf.cursor = self._smooth
-
-        # Finger extension
-        tips = [8, 12, 16, 20];  pips = [6, 10, 14, 18]
-        extended   = [lm[t][1] < lm[p][1] for t, p in zip(tips, pips)]
-        count      = sum(extended)
-        # Thumb extended = tip far from index MCP — works regardless of mirror
-        thumb_ext  = math.hypot(lm[4][0]-lm[5][0],
-                                lm[4][1]-lm[5][1]) > hand_size * 0.45
-
-        if norm_pinch < PINCH_THRESHOLD:
-            gf.state = GestureState.PINCHING
-        elif all(extended) and thumb_ext:
-            gf.state = GestureState.OPEN_PALM
-        elif not any(extended) and not thumb_ext:
-            # All fingers AND thumb curled in → fist
-            gf.state = GestureState.FIST
-        elif not any(extended) and thumb_ext:
-            gf.state = GestureState.THUMBS_UP
-        elif extended[0] and not any(extended[1:]):
-            gf.state = GestureState.POINTING
-        elif count > 0:
-            gf.state = GestureState.FINGERS_N
-            gf.finger_count = count
-        else:
-            gf.state = GestureState.IDLE
-
-        return gf
-
+    # ── public API ─────────────────────────────────────────────────────────
     def get(self) -> GestureFrame:
         with self._lock:
             return self._latest
@@ -214,38 +266,35 @@ class GestureEngine:
     def draw_debug(self, surface, gf: GestureFrame):
         if not gf.landmarks:
             return
+        color = (60, 200, 255) if not gf.is_ghost else (150, 150, 150)
         for a, b in _HAND_CONNECTIONS:
-            pygame.draw.line(surface, (60, 200, 255),
+            pygame.draw.line(surface, color,
                              gf.landmarks[a], gf.landmarks[b], 2)
         for x, y in gf.landmarks:
             pygame.draw.circle(surface, (255, 255, 255), (x, y), 4)
 
 
-# ── Hold-to-select tracker ─────────────────────────────────────────────────
+# ── Hold-to-select tracker ─────────────────────────────────────────────────────
 class HoldDetector:
     """
-    Tracks pinch-hold progress with a grace period.
-    Brief interruptions (hand flicker, single dropped frame) do not reset
-    progress — the hold timer only resets if the pinch breaks for longer
-    than GRACE_S seconds.
+    Hold progress with grace period — brief dropouts don't reset the ring.
+    Ghost frames (is_ghost=True) are treated as inactive to prevent
+    phantom selections when the hand briefly disappears.
     """
-    GRACE_S = 0.22   # seconds of interrupted pinch tolerated before reset
+    GRACE_S = 0.25
 
     def __init__(self, hold_seconds: float = 1.5):
         self.hold_seconds = hold_seconds
-        self._start     : dict[str, float] = {}   # key → hold start time
-        self._last_active: dict[str, float] = {}  # key → last time active=True
-        self._progress  : dict[str, float] = {}   # key → frozen progress at break
+        self._start      : dict[str, float] = {}
+        self._last_active: dict[str, float] = {}
+        self._progress   : dict[str, float] = {}
 
     def update(self, key: str, active: bool) -> tuple[float, bool]:
         now = time.time()
 
         if active:
             self._last_active[key] = now
-
             if key not in self._start:
-                # Fresh start or resuming after grace — adjust start so
-                # progress continues from where it was
                 already = self._progress.get(key, 0.0)
                 self._start[key] = now - already * self.hold_seconds
 
@@ -254,7 +303,6 @@ class HoldDetector:
             self._progress[key] = progress
 
             if progress >= 1.0:
-                # Clean up and fire
                 for d in (self._start, self._last_active, self._progress):
                     d.pop(key, None)
                 return 1.0, True
@@ -263,16 +311,13 @@ class HoldDetector:
         else:
             last = self._last_active.get(key)
             if last and (now - last) < self.GRACE_S:
-                # Within grace period — freeze progress, keep start alive
                 return self._progress.get(key, 0.0), False
 
-            # Grace period expired — full reset
             for d in (self._start, self._last_active, self._progress):
                 d.pop(key, None)
             return 0.0, False
 
     def reset(self, key: str | None = None):
-        """Manually reset one key or all keys."""
         if key is None:
             self._start.clear()
             self._last_active.clear()
